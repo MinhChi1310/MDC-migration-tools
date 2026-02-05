@@ -1,0 +1,15 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+.vs/
+
+# Database Backups and SQL scripts
+*.bak
+*.sql
+
+# User specific
+*.user
+
+# OS generated
+Thumbs.db
+Desktop.ini
