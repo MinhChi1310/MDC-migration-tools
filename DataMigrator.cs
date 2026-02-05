@@ -59,10 +59,11 @@ namespace Logistics.DbMerger
             {
                  whereClause = $" WHERE TenantId = {sourceTenantId.Value}";
                  Console.WriteLine($"   -> Filtering by TenantId = {sourceTenantId.Value}");
-            }
+                }
             else if (sourceTenantId.HasValue && !hasTenantId)
-            {
-                 Console.WriteLine("   -> Table has no TenantId. Migrating ALL rows (Global/System Table).");
+                {
+                    Console.WriteLine("   -> Table has no TenantId. Migrating ALL rows (Global/System Table).");
+                }
             }
 
             // Construct Query with Custom Injections
@@ -146,23 +147,23 @@ namespace Logistics.DbMerger
             else
             {
                 // Streaming Mode (No ID Transform)
-                 for (int i = 0; i < reader.FieldCount; i++)
-                 {
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
                      string colName = reader.GetName(i);
                      if (targetSchemaCols.Contains(colName))
                         bulkCopy.ColumnMappings.Add(colName, colName);
-                 }
+            }
 
-                try
-                {
-                    await bulkCopy.WriteToServerAsync(reader);
-                    Console.WriteLine($"\n[Data] Completed {sourceTableName}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"\n[Error] Failed to migrate {sourceTableName}: {ex.Message}");
-                }
+            try
+            {
+                await bulkCopy.WriteToServerAsync(reader);
+                Console.WriteLine($"\n[Data] Completed {sourceTableName}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\n[Error] Failed to migrate {sourceTableName}: {ex.Message}");
             }
         }
     }
+}
 }

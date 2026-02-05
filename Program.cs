@@ -255,15 +255,15 @@ namespace Logistics.DbMerger
                     sourceTableSet.Remove(t); // Handled
                 }
             }
-
+            
             // 2. Add Remaining Tables (that were not in the config list)
             foreach(var t in sourceTableSet)
             {
                 orderedTables.Add(t);
             }
-
+            
             Console.WriteLine($"[DataSync] Tables to Migrate (Ordered): {orderedTables.Count}");
-
+            
             foreach (var table in orderedTables)
             {
                 if (table == "sysdiagrams" || table == "Tenants" || table.StartsWith("__")) continue; // Skip systems
@@ -272,17 +272,18 @@ namespace Logistics.DbMerger
                 string targetTable = table;
                 
                 // 1. Check Explicit Mapping
-                if (ExplicitTableMappings.ContainsKey(table))
-                {
-                     string mappedTarget = ExplicitTableMappings[table];
+                     if (ExplicitTableMappings.ContainsKey(table))
+                     {
+                         string mappedTarget = ExplicitTableMappings[table];
                      targetTable = mappedTarget;
                      
-                     if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
-                     {
-                          isNew = false;
-                          Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
-                          await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
-                     }
+                         if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
+                         {
+                             targetTable = mappedTarget;
+                             isNew = false;
+                             Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
+                             await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                         }
                      else
                      {
                           Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
@@ -291,22 +292,24 @@ namespace Logistics.DbMerger
                 
                 // 2. Check Fuzzy Match (only if New and not explicitly mapped)
                 else if (isNew)
-                {
+                     {
                      string bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
                      if (bestMatch != null)
                      {
                          targetTable = bestMatch;
-                         isNew = false;
+                         isNew = false; 
                          Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
+                         // Sync Schema for Fuzzy Match
                          await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
                      }
+                     // other fuzzy rules...
                 }
                 
                 // 3. Sync Schema for Exact Matches (Column Evolution)
                 if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
                 {
                      await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
-                }
+                    }
 
                 // 4. Data Migration
                 if (!dryRun)
