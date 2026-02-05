@@ -233,7 +233,13 @@ namespace Logistics.DbMerger
 
             var schemaSync = new SchemaSync(sourceConn, targetConn);
             var migrator = new DataMigrator(sourceConn, targetConn, batchSize);
-            // var targetTables = await schemaSync.GetExistingTargetTablesAsync(); // we fetch later per table or cache? 
+            
+            // 2b. Smart User Sync (Before generic tables)
+            // Need to build User Map for Audit columns
+            var userMapping = new Dictionary<long, long>();
+            // Only sync users if we are proceeding with data
+            await SyncUsersAsync(sourceConn, targetConn, userMapping, sourceTenantId, targetTenantId, dryRun);
+
             // Caching target tables is good for fuzzy matching.
             var existingAdcTables = (await schemaSync.GetExistingTargetTablesAsync()).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -266,7 +272,7 @@ namespace Logistics.DbMerger
             
             foreach (var table in orderedTables)
             {
-                if (table == "sysdiagrams" || table == "Tenants" || table.StartsWith("__")) continue; // Skip systems
+                if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue; // Skip systems And Users
 
                 var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
                 string targetTable = table;
@@ -275,7 +281,7 @@ namespace Logistics.DbMerger
                      if (ExplicitTableMappings.ContainsKey(table))
                      {
                          string mappedTarget = ExplicitTableMappings[table];
-                     targetTable = mappedTarget;
+                         targetTable = mappedTarget;
                      
                          if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
                          {
@@ -314,7 +320,7 @@ namespace Logistics.DbMerger
                 // 4. Data Migration
                 if (!dryRun)
                 {
-                   await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId);
+                   await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping);
                 }
                 else
                 {
@@ -400,6 +406,80 @@ namespace Logistics.DbMerger
              await RunDataSync(sourceConn, targetConn, batchSize, dryRun);
         }
 
+
+        static async Task SyncUsersAsync(string sourceConnStr, string targetConnStr, Dictionary<long, long> userMapping, int? sourceTenantId, int? targetTenantId, bool dryRun)
+        {
+            Console.WriteLine("\n[Users] Starting Smart User Sync...");
+            
+            using var source = new SqlConnection(sourceConnStr);
+            using var target = new SqlConnection(targetConnStr);
+            
+            // 1. Fetch Source Users
+            // Filter by Tenant if provided
+            string sourceSql = "SELECT Id, UserName, EmailAddress FROM Users";
+            if (sourceTenantId.HasValue) sourceSql += " WHERE TenantId = @TenantId";
+            var sourceUsers = await source.QueryAsync<dynamic>(sourceSql, new { TenantId = sourceTenantId });
+            
+            // 2. Fetch Target Users (to find matches)
+            // Filter by Tenant if provided
+            string targetSql = "SELECT Id, UserName FROM Users";
+            if (targetTenantId.HasValue) targetSql += " WHERE TenantId = @TenantId";
+             var targetUsers = (await target.QueryAsync<dynamic>(targetSql, new { TenantId = targetTenantId }))
+                .ToDictionary(k => (string)k.UserName, v => (long)v.Id); // Dictionary<UserName, Id>
+
+            Console.WriteLine($"[Users] Found {sourceUsers.Count()} Source Users, {targetUsers.Count} Target Users.");
+
+            // 3. Process Each Source User
+            foreach (var sUser in sourceUsers)
+            {
+                string userName = sUser.UserName;
+                long sourceId = sUser.Id;
+                long targetId = 0;
+
+                if (targetUsers.ContainsKey(userName))
+                {
+                    // Match found!
+                    targetId = targetUsers[userName];
+                    // Console.WriteLine($"   [Match] {userName} ({sourceId} -> {targetId})"); 
+                }
+                else
+                {
+                    // New User - Insert
+                    if (!dryRun)
+                    {
+                        // We need to fetch FULL row to insert
+                        // Excluding Id to let Identity generate it
+                        var fullUser = await source.QuerySingleAsync<dynamic>("SELECT * FROM Users WHERE Id = @Id", new { Id = sourceId });
+                        var props = (IDictionary<string, object>)fullUser;
+                        var cols = props.Keys.Where(k => k != "Id").ToList();
+                        
+                        // Handle TenantId transformation in Insert
+                        if (sourceTenantId != targetTenantId && props.ContainsKey("TenantId"))
+                        {
+                            props["TenantId"] = targetTenantId; 
+                        }
+                        
+                        var vals = cols.Select(k => "@" + k).ToList();
+                        string insertSql = $"INSERT INTO Users ({string.Join(",", cols)}) VALUES ({string.Join(",", vals)}); SELECT CAST(SCOPE_IDENTITY() as bigint);";
+                        
+                        targetId = await target.ExecuteScalarAsync<long>(insertSql, (object)props);
+                        Console.WriteLine($"   [Insert] Created User {userName} (NewId: {targetId})");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"   [DryRun] Would Insert User {userName}");
+                        targetId = sourceId; // Mock
+                    }
+                }
+                
+                // Add to Map
+                if (!userMapping.ContainsKey(sourceId))
+                {
+                    userMapping.Add(sourceId, targetId);
+                }
+            }
+            Console.WriteLine($"[Users] User Mapping Built: {userMapping.Count} entries.");
+        }
 
         static string GetBestFuzzyMatch(string sourceTable, HashSet<string> targetTables)
         {
