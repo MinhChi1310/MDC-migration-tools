@@ -50,7 +50,8 @@ namespace Logistics.DbMerger
         {
             using var source = new SqlConnection(_sourceConnStr);
             
-            // 1. Fetch Columns with extended properties (Identity, Computed, etc.)
+            // 1. Fetch Columns with extended properties (Identity, Computed)
+            // Join with sys.computed_columns to get definition if computed
             var columns = await source.QueryAsync<dynamic>(@"
                 SELECT 
                     c.name AS ColumnName,
@@ -60,39 +61,67 @@ namespace Logistics.DbMerger
                     c.scale,
                     c.is_nullable,
                     c.is_identity,
-                    c.column_id
+                    c.is_computed,
+                    c.column_id,
+                    cc.definition as ComputedDefinition
                 FROM sys.columns c
                 INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
+                LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id AND c.column_id = cc.column_id
                 WHERE c.object_id = OBJECT_ID(@TableName)
                 ORDER BY c.column_id", new { TableName = tableName });
 
-            // 2. Fetch PK Info with Options
-            var pkInfo = await source.QueryFirstOrDefaultAsync<dynamic>(@"
+            // 2. Fetch Default Constraints
+            var defaults = await source.QueryAsync<dynamic>(@"
                 SELECT 
+                    name AS ConstraintName,
+                    definition AS DefaultValue,
+                    parent_column_id
+                FROM sys.default_constraints
+                WHERE parent_object_id = OBJECT_ID(@TableName)", new { TableName = tableName });
+            var defaultDict = defaults.ToDictionary(k => (int)k.parent_column_id, v => (string)v.DefaultValue);
+
+            // 3. Fetch Check Constraints
+            var checks = await source.QueryAsync<dynamic>(@"
+                SELECT definition AS CheckDefinition, name AS CheckName
+                FROM sys.check_constraints
+                WHERE parent_object_id = OBJECT_ID(@TableName)", new { TableName = tableName });
+
+            // 4. Fetch Indexes (PK and Non-Clustered)
+            var indexes = await source.QueryAsync<dynamic>(@"
+                SELECT 
+                    i.index_id,
                     i.name AS IndexName,
                     i.type_desc AS IndexType,
                     i.is_primary_key,
+                    i.is_unique,
                     i.is_padded,
                     i.ignore_dup_key,
                     i.allow_row_locks,
                     i.allow_page_locks,
                     i.fill_factor,
-                    s.no_recompute
+                    s.no_recompute,
+                    i.filter_definition
                 FROM sys.indexes i
                 LEFT JOIN sys.stats s ON i.object_id = s.object_id AND i.index_id = s.stats_id
-                WHERE i.object_id = OBJECT_ID(@TableName) AND i.is_primary_key = 1", new { TableName = tableName });
+                WHERE i.object_id = OBJECT_ID(@TableName) 
+                  AND i.type_desc <> 'HEAP'
+                ORDER BY i.is_primary_key DESC, i.name", new { TableName = tableName });
 
-            List<string> pkColumns = new List<string>();
-            if (pkInfo != null)
-            {
-                pkColumns = (await source.QueryAsync<string>(@"
-                    SELECT c.name 
-                    FROM sys.index_columns ic
-                    INNER JOIN sys.columns c ON ic.column_id = c.column_id AND ic.object_id = c.object_id
-                    INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-                    WHERE i.object_id = OBJECT_ID(@TableName) AND i.is_primary_key = 1
-                    ORDER BY ic.key_ordinal", new { TableName = tableName })).ToList();
-            }
+            // Fetch Index Columns for ALL indexes
+            var indexCols = await source.QueryAsync<dynamic>(@"
+                SELECT 
+                    ic.index_id,
+                    c.name AS ColumnName,
+                    ic.is_descending_key,
+                    ic.is_included_column
+                FROM sys.index_columns ic
+                INNER JOIN sys.columns c ON ic.column_id = c.column_id AND ic.object_id = c.object_id
+                WHERE ic.object_id = OBJECT_ID(@TableName)
+                ORDER BY ic.index_id, ic.key_ordinal", new { TableName = tableName });
+            
+            var indexColLookup = indexCols.GroupBy(x => (int)x.index_id).ToDictionary(g => g.Key, g => g.ToList());
+
+            var pkInfo = indexes.FirstOrDefault(i => i.is_primary_key == true);
 
             var sb = new StringBuilder();
             sb.AppendLine("SET ANSI_NULLS ON");
@@ -107,30 +136,47 @@ namespace Logistics.DbMerger
             for (int i = 0; i < colList.Count; i++)
             {
                 var col = colList[i];
-                string typeDef = $"[{col.DataType}]";
-                string typeLower = ((string)col.DataType).ToLower();
-
-                if (typeLower == "nvarchar" || typeLower == "varchar" || typeLower == "char" || typeLower == "nchar" || typeLower == "varbinary" || typeLower == "binary")
-                {
-                    string len = col.max_length == -1 ? "max" : (typeLower.StartsWith("n") ? col.max_length / 2 : col.max_length).ToString();
-                    typeDef += $"({len})";
-                    if (len == "max") hasLob = true;
-                }
-                else if (typeLower == "decimal" || typeLower == "numeric")
-                {
-                    typeDef += $"({col.precision}, {col.scale})";
-                }
-                else if (typeLower == "text" || typeLower == "ntext" || typeLower == "image" || typeLower == "xml")
-                {
-                    hasLob = true;
-                }
-
-                string identity = col.is_identity == true ? " IDENTITY(1,1)" : "";
-                string nullable = col.is_nullable == true ? " NULL" : " NOT NULL";
                 
-                sb.Append($"	[{col.ColumnName}] {typeDef}{identity}{nullable}");
+                // Computed Column
+                if (col.is_computed)
+                {
+                     sb.Append($"	[{col.ColumnName}] AS ({col.ComputedDefinition})");
+                }
+                else
+                {
+                    string typeDef = $"[{col.DataType}]";
+                    string typeLower = ((string)col.DataType).ToLower();
+
+                    if (typeLower == "nvarchar" || typeLower == "varchar" || typeLower == "char" || typeLower == "nchar" || typeLower == "varbinary" || typeLower == "binary")
+                    {
+                        string len = col.max_length == -1 ? "max" : (typeLower.StartsWith("n") ? col.max_length / 2 : col.max_length).ToString();
+                        typeDef += $"({len})";
+                        if (len == "max") hasLob = true;
+                    }
+                    else if (typeLower == "decimal" || typeLower == "numeric")
+                    {
+                        typeDef += $"({col.precision}, {col.scale})";
+                    }
+                    else if (typeLower == "text" || typeLower == "ntext" || typeLower == "image" || typeLower == "xml")
+                    {
+                        hasLob = true;
+                    }
+
+                    string identity = col.is_identity == true ? " IDENTITY(1,1)" : "";
+                    string nullable = col.is_nullable == true ? " NULL" : " NOT NULL";
+                    
+                    sb.Append($"	[{col.ColumnName}] {typeDef}{identity}{nullable}");
+                    
+                    // Default Constraint
+                    if (defaultDict.ContainsKey((int)col.column_id))
+                    {
+                        string defName = $"DF_{tableName}_{col.ColumnName}"; 
+                        sb.Append($" CONSTRAINT [{defName}] DEFAULT {defaultDict[(int)col.column_id]}");
+                    }
+                }
                 
-                if (i < colList.Count - 1 || pkInfo != null)
+                // Comma Logic
+                if (i < colList.Count - 1 || pkInfo != null || checks.Any()) 
                     sb.AppendLine(",");
                 else
                     sb.AppendLine("");
@@ -141,17 +187,21 @@ namespace Logistics.DbMerger
             {
                 sb.AppendLine($" CONSTRAINT [{pkInfo.IndexName}] PRIMARY KEY {pkInfo.IndexType} ");
                 sb.AppendLine("(");
-                for(int k=0; k<pkColumns.Count; k++)
+                
+                var pkCols = indexColLookup.ContainsKey((int)pkInfo.index_id) ? indexColLookup[(int)pkInfo.index_id] : new List<dynamic>();
+                
+                for(int k=0; k<pkCols.Count; k++)
                 {
-                     sb.Append($"	[{pkColumns[k]}] ASC");
-                     if (k < pkColumns.Count - 1) sb.Append(",");
+                     var c = pkCols[k];
+                     sb.Append($"	[{c.ColumnName}] {(c.is_descending_key ? "DESC" : "ASC")}");
+                     if (k < pkCols.Count - 1) sb.Append(",");
                      sb.AppendLine();
                 }
                 
                 // Construct Options
                 var opts = new List<string>();
                 opts.Add($"PAD_INDEX = {(pkInfo.is_padded == true ? "ON" : "OFF")}");
-                opts.Add($"STATISTICS_NORECOMPUTE = {(pkInfo.no_recompute == 1 ? "ON" : "OFF")}"); // sys.stats.no_recompute is bit? usually 0/1 or bool
+                opts.Add($"STATISTICS_NORECOMPUTE = {(pkInfo.no_recompute == 1 ? "ON" : "OFF")}"); 
                 opts.Add($"IGNORE_DUP_KEY = {(pkInfo.ignore_dup_key == true ? "ON" : "OFF")}");
                 opts.Add($"ALLOW_ROW_LOCKS = {(pkInfo.allow_row_locks == true ? "ON" : "OFF")}");
                 opts.Add($"ALLOW_PAGE_LOCKS = {(pkInfo.allow_page_locks == true ? "ON" : "OFF")}");
@@ -160,14 +210,69 @@ namespace Logistics.DbMerger
                     opts.Add($"FILLFACTOR = {pkInfo.fill_factor}");
                 }
                 
-                sb.AppendLine($")WITH ({string.Join(", ", opts)}) ON [PRIMARY]");
+                sb.Append($")WITH ({string.Join(", ", opts)}) ON [PRIMARY]");
+                
+                if (checks.Any()) sb.AppendLine(","); else sb.AppendLine("");
+            }
+
+            // Append Check Constraints
+            var checkList = checks.ToList();
+            for(int c=0; c < checkList.Count; c++)
+            {
+                var chk = checkList[c];
+                sb.Append($"	CONSTRAINT [{chk.CheckName}] CHECK {chk.CheckDefinition}");
+                if (c < checkList.Count - 1) sb.AppendLine(","); else sb.AppendLine("");
             }
 
             sb.Append(") ON [PRIMARY]");
-            if (hasLob) sb.Append(" TEXTIMAGE_ON [PRIMARY]"); // Heuristic: append if any LOB likely
+            if (hasLob) sb.Append(" TEXTIMAGE_ON [PRIMARY]"); 
             
             sb.AppendLine("");
             sb.AppendLine("GO");
+            
+            // Append Non-Clustered Indexes
+            foreach(var idx in indexes)
+            {
+                if (idx.is_primary_key == true) continue;
+                
+                string unique = idx.is_unique == true ? "UNIQUE " : "";
+                string type = idx.IndexType; // NONCLUSTERED
+                sb.AppendLine($"CREATE {unique}{type} INDEX [{idx.IndexName}] ON [dbo].[{tableName}]");
+                sb.Append("(");
+                
+                var cols = indexColLookup.ContainsKey((int)idx.index_id) ? indexColLookup[(int)idx.index_id] : new List<dynamic>();
+                var keyCols = cols.Where(x => x.is_included_column == false).ToList();
+                var incCols = cols.Where(x => x.is_included_column == true).ToList();
+                
+                for(int k=0; k<keyCols.Count; k++)
+                {
+                    var c = keyCols[k];
+                    sb.Append($"[{c.ColumnName}] {(c.is_descending_key ? "DESC" : "ASC")}");
+                    if (k < keyCols.Count - 1) sb.Append(", ");
+                }
+                sb.Append(")");
+                
+                if (incCols.Any())
+                {
+                    sb.AppendLine();
+                    sb.Append("INCLUDE (");
+                    for(int k=0; k<incCols.Count; k++)
+                    {
+                        sb.Append($"[{incCols[k].ColumnName}]");
+                        if (k < incCols.Count - 1) sb.Append(", ");
+                    }
+                    sb.Append(")");
+                }
+                
+                if (!string.IsNullOrEmpty(idx.filter_definition))
+                {
+                     sb.AppendLine();
+                     sb.Append($"WHERE {idx.filter_definition}");
+                }
+                
+                sb.AppendLine(" WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]");
+                sb.AppendLine("GO");
+            }
 
             return sb.ToString();
         }
