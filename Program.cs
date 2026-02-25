@@ -144,6 +144,10 @@ namespace Logistics.DbMerger
                      await schemaSync.SyncTableSchemaAsync(sourceTable, targetTable, dryRun);
                 }
             }
+
+            // After all tables and columns are synced, check constraints across all tables
+            Console.WriteLine("\nSyncing constraints across all tables...");
+            await schemaSync.SyncAllConstraintsAsync(ExplicitTableMappings, dryRun);
         }
 
         static async Task RunObjectSync(string sourceConn, string targetConn, bool dryRun)
