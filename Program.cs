@@ -688,17 +688,25 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
             using var target = new SqlConnection(targetConnStr);
             
             // 1. Fetch Source Users
-            // Filter by Tenant if provided
-            string sourceSql = "SELECT Id, UserName, EmailAddress FROM Users";
+            // Include TenantId to support (TenantId, UserName) matching
+            string sourceSql = "SELECT Id, UserName, EmailAddress, TenantId FROM Users";
             if (sourceTenantId.HasValue) sourceSql += " WHERE TenantId = @TenantId";
             var sourceUsers = await source.QueryAsync<dynamic>(sourceSql, new { TenantId = sourceTenantId });
             
             // 2. Fetch Target Users (to find matches)
-            // Filter by Tenant if provided
-            string targetSql = "SELECT Id, UserName FROM Users";
+            // Include TenantId and key by (TenantId, UserName) to avoid duplicates in 'all tenant' mode
+            string targetSql = "SELECT Id, UserName, TenantId FROM Users";
             if (targetTenantId.HasValue) targetSql += " WHERE TenantId = @TenantId";
-             var targetUsers = (await target.QueryAsync<dynamic>(targetSql, new { TenantId = targetTenantId }))
-                .ToDictionary(k => (string)k.UserName, v => (long)v.Id); // Dictionary<UserName, Id>
+            var targetRows = await target.QueryAsync<dynamic>(targetSql, new { TenantId = targetTenantId });
+            var targetUsers = targetRows.ToDictionary(
+                k =>
+                {
+                    int? tid = (int?)k.TenantId;
+                    string name = (string)k.UserName;
+                    return (tid?.ToString() ?? "null") + "|" + name;
+                },
+                v => (long)v.Id,
+                StringComparer.OrdinalIgnoreCase); // Dictionary<(TenantId, UserName), Id>
 
             Console.WriteLine($"[Users] Found {sourceUsers.Count()} Source Users, {targetUsers.Count} Target Users.");
 
@@ -709,11 +717,14 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                 long sourceId = sUser.Id;
                 long targetId = 0;
 
-                if (targetUsers.ContainsKey(userName))
+                int? keyTenantId = targetTenantId ?? (int?)sUser.TenantId;
+                string dictKey = (keyTenantId?.ToString() ?? "null") + "|" + userName;
+
+                if (targetUsers.ContainsKey(dictKey))
                 {
                     // Match found!
-                    targetId = targetUsers[userName];
-                    // Console.WriteLine($"   [Match] {userName} ({sourceId} -> {targetId})"); 
+                    targetId = targetUsers[dictKey];
+                    // Console.WriteLine($"   [Match] {dictKey} ({sourceId} -> {targetId})"); 
                 }
                 else
                 {
